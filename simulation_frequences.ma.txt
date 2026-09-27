@@ -1,0 +1,281 @@
+% =========================================================================
+% Simulation frequences 
+% =========================================================================
+rng(1); % Set random number generator seed to ensure Monte Carlo reproducibility
+Nh = 2; % Define the number of harmonic pairs per fundamental component
+snr_list = 0:10:30; % Define Signal-to-Noise Ratio (SNR) evaluation range in dB
+num_iterations = 100; % Define total number of Monte Carlo trial iterations
+ 
+min_spacing_hypothese = 5.0; % Define minimum frequency resolution constraint in Hz
+ 
+mean_rmse = zeros(length(snr_list), 4); % Preallocate mean Root Mean Square Error matrix (FFT, ESPRIT, MUSIC, SERBES)
+mean_mae  = zeros(length(snr_list), 4); % Preallocate mean Mean Absolute Error matrix
+mean_nmse = zeros(length(snr_list), 4); % Preallocate mean Normalized Mean Square Error matrix
+mean_pd   = zeros(length(snr_list), 4); % Preallocate mean Probability of Detection matrix
+mean_time = zeros(length(snr_list), 4); % Preallocate mean execution time performance matrix
+mean_mem  = zeros(length(snr_list), 4); % Preallocate mean memory footprint matrix in kilobytes
+ 
+tol_match_globale = 1.5; % Set global frequency matching tolerance threshold in Hz
+ 
+for snr_idx = 1:length(snr_list) % Iterate through evaluated SNR levels
+    current_snr = snr_list(snr_idx); % Extract current operational SNR value
+    
+    accum_rmse = zeros(num_iterations, 4); % Preallocate iteration storage matrix for RMSE
+    accum_mae  = zeros(num_iterations, 4); % Preallocate iteration storage matrix for MAE
+    accum_nmse = zeros(num_iterations, 4); % Preallocate iteration storage matrix for NMSE
+    accum_pd   = zeros(num_iterations, 4); % Preallocate iteration storage matrix for Detection Rate
+    accum_time = zeros(num_iterations, 4); % Preallocate iteration storage matrix for execution time
+    accum_mem  = zeros(num_iterations, 4); % Preallocate iteration storage matrix for memory usage
+    
+    fprintf('\n>>> Simulation en cours pour SNR = %d dB (%d itérations)... <<<\n', current_snr, num_iterations); % Display simulation execution prompt
+ 
+    for iter = 1:num_iterations % Begin Monte Carlo simulation loop
+        
+        fs_line = 50; % Fundamental power grid frequency in Hz
+        g       = 0.033; % Motor slip coefficient parameter
+        p_poles = 2; % Number of motor pole pairs
+        i_idx   = [1, 3, 5]; % Array of harmonic order indices
+        Fs      = 1000; % Sampling frequency in Hz
+        T       = 3.0; % Total signal observation duration in seconds
+        t       = 0:1/Fs:T-1/Fs; % Construct discrete time vector
+ 
+        fccd = []; fccg = []; % Initialize arrays for upper and lower sideband frequencies
+        for kk = 1:Nh % Loop over harmonic orders
+            fccd = [fccd, abs(fs_line .* ((kk./p_poles).*(1-g) + i_idx))]; % Compute upper sideband frequencies
+            fccg = [fccg, abs(fs_line .* ((kk./p_poles).*(1-g) - i_idx))]; % Compute lower sideband frequencies
+        end % Terminate sideband calculation loop
+        f_theo_all = sort(unique([fs_line, fccd, fccg]))'; % Extract sorted ground-truth theoretical frequencies
+        K = length(f_theo_all); % Total number of expected signal frequency components
+ 
+        amplitude_defaut = 0.05; % Relative fault component amplitude ratio
+        x_real = 2.0 * sin(2*pi*fs_line*t); % Generate real fundamental sinusoidal waveform
+        for f = [fccd, fccg] % Iterate over sideband frequencies
+            x_real = x_real + amplitude_defaut * sin(2*pi*f*t); % Superimpose real fault harmonics
+        end % Terminate real signal construction loop
+        x_real = awgn(x_real, current_snr, 'measured'); % Add additive white Gaussian noise to real signal
+ 
+        phi_line = 2*pi*rand(); % Generate random phase shift for fundamental component
+        x_complex = 2.0 * exp(1i*(2*pi*fs_line*t + phi_line)); % Construct complex fundamental analytic signal
+        for f = [fccd, fccg] % Iterate over sideband frequencies
+            phi_k = 2*pi*rand(); % Generate random phase shift for harmonic component
+            x_complex = x_complex + amplitude_defaut * exp(1i*(2*pi*f*t + phi_k)); % Superimpose complex fault harmonics
+        end % Terminate complex signal construction loop
+        noise_power = var(x_real) / 10^(current_snr/10); % Calculate noise power variance based on target SNR
+        noise_complex = sqrt(noise_power/2) * (randn(size(t)) + 1i*randn(size(t))); % Generate complex circular AWGN
+        x_complex = x_complex + noise_complex; % Add complex noise vector to analytical signal model
+ 
+        tic; % Start timer for Fast Fourier Transform execution
+        N_fft  = length(x_complex); % Obtain discrete signal length for FFT
+        X_fft  = abs(fft(x_complex)/N_fft); % Calculate normalized single-sided magnitude spectrum
+        f_axis = (0:N_fft-1)*(Fs/N_fft); % Generate discrete frequency axis in Hz
+        info = whos('X_fft','f_axis'); % Retrieve memory metadata for FFT spectral variables
+        mem_fft = sum([info.bytes])/1024; % Compute memory footprint for FFT algorithm in KB
+        t_fft = toc; % Record elapsed runtime for core FFT operation
+ 
+        matched_fft = zeros(size(f_theo_all)); % Preallocate frequency array for FFT matching
+        for i = 1:length(f_theo_all) % Iterate through target ground-truth frequencies
+            zone = (f_axis > f_theo_all(i)-tol_match_globale & f_axis < f_theo_all(i)+tol_match_globale); % Define tolerance matching window
+            [~, idx_max] = max(X_fft(zone)); % Locate maximum magnitude peak within target window
+            f_zone = f_axis(zone); % Extract localized frequency vector within window
+            if ~isempty(f_zone) && any(zone) % Validate presence of candidate peak bins
+               matched_fft(i) = f_zone(idx_max); % Assign identified frequency peak value
+            else % Handle unassigned frequency instances
+               matched_fft(i) = NaN; % Assign NaN when peak is absent within tolerance window
+            end % Terminate peak evaluation condition
+        end % Terminate FFT matching loop
+ 
+        tic; % Start timer for ESPRIT algorithm execution
+        L = floor(length(x_complex)/3); % Define pencil parameter length for Hankel matrix
+        H_mat = hankel(x_complex(1:L), x_complex(L:end)); % Construct Hankel data matrix
+        [U, S, V] = svd(H_mat,'econ'); % Perform economy-size Singular Value Decomposition
+        p_order = K; % Assign subspace model order based on theoretical component count
+        Us  = U(:, 1:p_order); % Extract signal subspace basis vectors
+        Phi = Us(1:end-1,:) \ Us(2:end,:); % Solve shift-invariance operator via least-squares
+        info = whos('H_mat','U','S','V','Us','Phi'); % Retrieve memory metadata for ESPRIT variables
+        mem_esprit = sum([info.bytes])/1024; % Compute memory footprint for ESPRIT in KB
+        f_esprit_raw   = angle(eig(Phi)) * Fs / (2*pi); % Compute frequency estimates from eigenvalues of Phi
+        t_esprit = toc; % Record elapsed runtime for core ESPRIT operation
+ 
+        f_esprit_pos   = f_esprit_raw(f_esprit_raw > 0.5 & f_esprit_raw < Fs/2); % Filter out non-positive and out-of-band estimates
+        f_esprit_clean = unique(round(sort(f_esprit_pos), 6)); % Remove duplicate estimates and round to 6 decimal places
+        
+        matched_esprit = zeros(size(f_theo_all)); % Preallocate frequency array for ESPRIT matching
+        used_esp = false(size(f_esprit_clean)); % Initialize allocation tracking mask for ESPRIT estimates
+        for i = 1:length(f_theo_all) % Iterate through target ground-truth frequencies
+            if isempty(f_esprit_clean) % Handle case where no valid candidates exist
+                matched_esprit(i) = NaN; % Assign NaN value
+                continue; % Skip to next target frequency
+            end % Terminate empty set evaluation
+            dists = abs(f_esprit_clean - f_theo_all(i)); % Compute absolute frequency deviations
+            dists(used_esp) = Inf; % Exclude previously matched frequency estimates
+            [val, idx] = min(dists); % Locate closest unallocated candidate frequency
+            if val < tol_match_globale % Check if candidate falls within global matching tolerance
+                matched_esprit(i) = f_esprit_clean(idx); % Assign matched candidate frequency
+                used_esp(idx) = true; % Mark estimate index as allocated
+            else % Handle tolerance violation condition
+                matched_esprit(i) = NaN; % Assign NaN when deviation exceeds threshold
+            end % Terminate tolerance check condition
+        end % Terminate ESPRIT matching loop
+ 
+        tic; % Start timer for MUSIC algorithm execution
+        [P_music, f_music_axis] = pmusic(x_complex, p_order, 65536, Fs, ... % Compute MUSIC pseudospectrum
+                                         floor(length(x_complex)/4), floor(length(x_complex)/8)); % Set correlation window and overlap lengths
+        info = whos('P_music','f_music_axis'); % Retrieve memory metadata for MUSIC variables
+        mem_music = sum([info.bytes])/1024; % Compute memory footprint for MUSIC algorithm in KB
+        t_music = toc; % Record elapsed runtime for core MUSIC operation
+ 
+        [pks, locs] = findpeaks(P_music, ... % Locate local spectral peaks in MUSIC pseudospectrum
+            'SortStr', 'descend', ... % Sort detected peaks by magnitude in descending order
+            'MinPeakDistance', round(5/(Fs/65536))); % Apply minimum peak separation constraint
+            
+        [~, sort_idx] = sort(pks, 'descend'); % Sort spectral peaks by power magnitude
+        top_locs = locs(sort_idx(1:min(length(locs), p_order))); % Select dominant peak locations up to signal subspace dimension
+        f_music_peaks = sort(f_music_axis(top_locs)); % Map peak indices to physical frequency values in Hz
+        matched_music = zeros(size(f_theo_all)); % Preallocate frequency array for MUSIC matching
+        used_mus = false(size(f_music_peaks)); % Initialize allocation tracking mask for MUSIC estimates
+        for i = 1:length(f_theo_all) % Iterate through target ground-truth frequencies
+            if isempty(f_music_peaks) % Handle case where no pseudospectrum peaks are detected
+                matched_music(i) = NaN; % Assign NaN value
+                continue; % Skip to next target frequency
+            end % Terminate empty set evaluation
+            dists = abs(f_music_peaks - f_theo_all(i)); % Compute frequency distance vector
+            dists(used_mus) = Inf; % Suppress candidate frequencies already assigned
+            [val, idx] = min(dists); % Identify nearest available MUSIC frequency candidate
+            if val < tol_match_globale % Validate deviation against global matching tolerance
+                matched_music(i) = f_music_peaks(idx); % Assign valid matched MUSIC frequency estimate
+                used_mus(idx) = true; % Flag candidate index as allocated
+            else % Handle tolerance breach condition
+                matched_music(i) = NaN; % Assign NaN when distance exceeds threshold
+            end % Terminate matching condition
+        end % Terminate MUSIC matching loop
+ 
+        tic; % Start timer for SERBES algorithm execution
+        [f_serbes_raw, ~] = multFreqEst(x_complex, K, 'Fs', Fs); % Call core SERBES multi-frequency estimation algorithm
+        
+        info = whos('f_serbes_raw'); % Retrieve memory metadata for SERBES estimation variable
+        mem_serbes = sum([info.bytes])/1024; % Compute memory footprint for SERBES algorithm in KB
+        t_serbes = toc; % Record elapsed runtime for core SERBES operation
+ 
+        f_serbes_pos = sort(real(f_serbes_raw)); % Extract real parts and sort SERBES frequency estimates
+        f_serbes_pos = f_serbes_pos(f_serbes_pos > 0.5 & f_serbes_pos < Fs/2); % Filter out-of-band and non-positive frequency estimates
+ 
+        matched_serbes = zeros(size(f_theo_all)); % Preallocate frequency array for SERBES matching
+        used_ser = false(size(f_serbes_pos)); % Initialize allocation tracking mask for SERBES estimates
+        for i = 1:length(f_theo_all) % Iterate through target ground-truth frequencies
+            if isempty(f_serbes_pos), matched_serbes(i) = NaN; continue; end % Assign NaN if candidate estimation vector is empty
+            dists = abs(f_serbes_pos - f_theo_all(i)); % Compute frequency deviation vector
+            dists(used_ser) = Inf; % Exclude previously selected SERBES estimates
+            [val, idx] = min(dists); % Identify nearest unallocated SERBES estimate candidate
+            if val < tol_match_globale % Validate candidate against global tolerance threshold
+                matched_serbes(i) = f_serbes_pos(idx); % Assign matched SERBES frequency estimate
+                used_ser(idx) = true; % Flag estimate index as assigned
+            else % Handle threshold breach condition
+                matched_serbes(i) = NaN; % Assign NaN when deviation exceeds matching threshold
+            end % Terminate matching threshold evaluation
+        end % Terminate SERBES matching loop
+ 
+        Erreur_FFT    = abs(f_theo_all - matched_fft); % Compute absolute estimation error for FFT
+        Erreur_ESPRIT = abs(f_theo_all - matched_esprit); % Compute absolute estimation error for ESPRIT
+        Erreur_MUSIC  = abs(f_theo_all - matched_music); % Compute absolute estimation error for MUSIC
+        Erreur_SERBES = abs(f_theo_all - matched_serbes); % Compute absolute estimation error for SERBES
+ 
+        calc_metrics = @(err, f_ref) deal( ... % Define anonymous function handle to evaluate quantitative metrics
+          sqrt(mean(err(~isnan(err)).^2, 'omitnan')), ... % Compute Root Mean Square Error (RMSE) excluding NaNs
+          mean(abs(err(~isnan(err))), 'omitnan'), ... % Compute Mean Absolute Error (MAE) excluding NaNs
+          mean(err(~isnan(err)).^2, 'omitnan') / mean(f_ref(~isnan(err)).^2, 'omitnan'), ... % Compute Normalized Mean Square Error (NMSE)
+          sum(~isnan(err)) / length(err) * 100); % Compute Probability of Detection rate (Pd percentage)
+ 
+        [r_fft, m_fft, n_fft, pd_fft] = calc_metrics(Erreur_FFT,  f_theo_all); % Evaluate statistical metrics for FFT
+        [r_esp, m_esp, n_esp, pd_esp] = calc_metrics(Erreur_ESPRIT, f_theo_all); % Evaluate statistical metrics for ESPRIT
+        [r_mus, m_mus, n_mus, pd_mus] = calc_metrics(Erreur_MUSIC, f_theo_all); % Evaluate statistical metrics for MUSIC
+        [r_ser, m_ser, n_ser, pd_ser] = calc_metrics(Erreur_SERBES, f_theo_all); % Evaluate statistical metrics for SERBES
+ 
+        accum_rmse(iter, :) = [r_fft, r_esp, r_mus, r_ser]; % Accumulate current iteration RMSE values across methods
+        accum_mae(iter, :)  = [m_fft, m_esp, m_mus, m_ser]; % Accumulate current iteration MAE values across methods
+        accum_nmse(iter, :) = [n_fft, n_esp, n_mus, n_ser]; % Accumulate current iteration NMSE values across methods
+        accum_pd(iter, :)   = [pd_fft, pd_esp, pd_mus, pd_ser]; % Accumulate current iteration Detection Rates across methods
+        accum_time(iter, :) = [t_fft, t_esprit, t_music, t_serbes]; % Accumulate current iteration execution runtimes
+        accum_mem(iter, :)  = [mem_fft, mem_esprit, mem_music, mem_serbes]; % Accumulate current iteration memory usage footprints
+        
+    end % Terminate Monte Carlo iteration loop
+    
+    mean_rmse(snr_idx, :) = mean(accum_rmse, 1, 'omitnan'); % Calculate mean RMSE across Monte Carlo trials for current SNR
+    mean_mae(snr_idx, :)  = mean(accum_mae, 1, 'omitnan'); % Calculate mean MAE across Monte Carlo trials for current SNR
+    mean_nmse(snr_idx, :) = mean(accum_nmse, 1, 'omitnan'); % Calculate mean NMSE across Monte Carlo trials for current SNR
+    mean_pd(snr_idx, :)   = mean(accum_pd, 1, 'omitnan'); % Calculate mean Probability of Detection across trials
+    mean_time(snr_idx, :) = mean(accum_time, 1, 'omitnan'); % Calculate mean algorithm execution runtime across trials
+    mean_mem(snr_idx, :)  = mean(accum_mem, 1, 'omitnan'); % Calculate mean algorithm memory footprint across trials
+    
+    fprintf('\n================ RÉSULTATS MOYENS SNR = %d dB (Nh=%d, %d Itérations) ================\n', current_snr, Nh, num_iterations); % Print SNR evaluation header
+    T_res = table(f_theo_all, matched_fft, Erreur_FFT, matched_esprit, Erreur_ESPRIT, ... % Construct MATLAB results summary table
+                matched_music, Erreur_MUSIC, matched_serbes, Erreur_SERBES, ... % Include estimated frequencies and error vectors
+        'VariableNames', {'Theorie', 'FFT', 'Err_FFT', 'ESPRIT', 'Err_ESPRIT', 'MUSIC', 'Err_MUSIC', 'SERBES', 'Err_SERBES'}); % Set table variable headers
+    disp(T_res); % Display evaluation table in console output
+    
+    fprintf('\n--- COMPARATIF MÉTRIQUES GLOBALES (MOYENNE) ---\n'); % Print global metric section header
+    fprintf('FFT    : RMSE = %.4f | MAE = %.4f | NMSE = %.2e | Détection = %.1f%%\n', mean_rmse(snr_idx, 1), mean_mae(snr_idx, 1), mean_nmse(snr_idx, 1), mean_pd(snr_idx, 1)); % Display FFT mean metrics
+    fprintf('ESPRIT : RMSE = %.4f | MAE = %.4f | NMSE = %.2e | Détection = %.1f%%\n', mean_rmse(snr_idx, 2), mean_mae(snr_idx, 2), mean_nmse(snr_idx, 2), mean_pd(snr_idx, 2)); % Display ESPRIT mean metrics
+    fprintf('MUSIC  : RMSE = %.4f | MAE = %.4f | NMSE = %.2e | Détection = %.1f%%\n', mean_rmse(snr_idx, 3), mean_mae(snr_idx, 3), mean_nmse(snr_idx, 3), mean_pd(snr_idx, 3)); % Display MUSIC mean metrics
+    fprintf('SERBES : RMSE = %.4f | MAE = %.4f | NMSE = %.2e | Détection = %.1f%%\n', mean_rmse(snr_idx, 4), mean_mae(snr_idx, 4), mean_nmse(snr_idx, 4), mean_pd(snr_idx, 4)); % Display SERBES mean metrics
+    
+    fprintf('\n--- PERFORMANCE RESSOURCES (MOYENNE) ---\n'); % Print computational resource section header
+    fprintf('Temps (s)   | FFT: %.5f | ESPRIT: %.5f | MUSIC: %.5f | SERBES: %.5f\n', ... % Display computational runtime metrics
+          mean_time(snr_idx, 1), mean_time(snr_idx, 2), mean_time(snr_idx, 3), mean_time(snr_idx, 4)); % Pass timing array values
+    fprintf('Memoire(KB) | FFT: %.2f | ESPRIT: %.2f | MUSIC: %.2f | SERBES: %.2f\n', ... % Display computational memory consumption metrics
+          mean_mem(snr_idx, 1), mean_mem(snr_idx, 2), mean_mem(snr_idx, 3), mean_mem(snr_idx, 4)); % Pass memory array values
+end % Terminate SNR evaluation loop
+
+algos = {'FFT', 'ESPRIT', 'MUSIC', 'SERBES'}; % Define algorithm string cell array for graphical legends
+colors = [0.2 0.6 1; 0.2 0.8 0.2; 1 0.4 0.2; 0.8 0.2 0.8]; % Specify custom RGB color palette for plot visualization
+ 
+figure('Name', 'RMSE Moyen vs SNR'); % Initialize figure container for mean RMSE evaluation
+hold on; % Retain figure graphics handle for multi-curve plotting
+for idx = 1:4 % Iterate through algorithm index vector
+    plot(snr_list, mean_rmse(:, idx), '-o', 'LineWidth', 2, 'Color', colors(idx, :), 'DisplayName', algos{idx}); % Plot RMSE curves vs SNR
+end % Terminate plotting loop
+xlabel('SNR (dB)'); ylabel('RMSE Moyen (Hz)'); % Assign axis label descriptions
+title(sprintf('RMSE en fonction du SNR (Nh = %d, %d Itérations)', Nh, num_iterations)); % Set main figure title
+legend('Location', 'best'); grid on; % Activate figure legend and grid overlay
+ 
+figure('Name', 'MAE Moyen vs SNR'); % Initialize figure container for mean MAE evaluation
+hold on; % Retain figure graphics handle
+for idx = 1:4 % Iterate through algorithm index vector
+    plot(snr_list, mean_mae(:, idx), '-s', 'LineWidth', 2, 'Color', colors(idx, :), 'DisplayName', algos{idx}); % Plot MAE curves vs SNR
+end % Terminate plotting loop
+xlabel('SNR (dB)'); ylabel('MAE Moyen (Hz)'); % Assign axis label descriptions
+title(sprintf('MAE en fonction du SNR (Nh = %d, %d Itérations)', Nh, num_iterations)); % Set main figure title
+legend('Location', 'best'); grid on; % Activate figure legend and grid overlay
+ 
+figure('Name', 'Taux de Détection vs SNR'); % Initialize figure container for Probability of Detection
+hold on; % Retain figure graphics handle
+for idx = 1:4 % Iterate through algorithm index vector
+    plot(snr_list, mean_pd(:, idx), '-d', 'LineWidth', 2, 'Color', colors(idx, :), 'DisplayName', algos{idx}); % Plot Probability of Detection curves vs SNR
+end % Terminate plotting loop
+xlabel('SNR (dB)'); ylabel('Taux de Détection (%)'); % Assign axis label descriptions
+title(sprintf('Fiabilité de détection en fonction du SNR (%d Itérations)', num_iterations)); % Set main figure title
+ylim([0 105]); legend('Location', 'best'); grid on; % Enforce y-axis boundaries and display grid overlay
+ 
+figure('Name', 'NMSE Moyen vs SNR'); % Initialize figure container for Normalized MSE
+hold on; % Retain figure graphics handle
+for idx = 1:4 % Iterate through algorithm index vector
+    semilogy(snr_list, mean_nmse(:, idx), '-^', 'LineWidth', 2, 'Color', colors(idx, :), 'DisplayName', algos{idx}); % Plot logarithmic NMSE curves vs SNR
+end % Terminate plotting loop
+xlabel('SNR (dB)'); ylabel('NMSE Moyen (Log)'); % Assign axis label descriptions
+title(sprintf('NMSE en fonction du SNR (Nh = %d, %d Itérations)', Nh, num_iterations)); % Set main figure title
+legend('Location', 'best'); grid on; % Activate figure legend and grid overlay
+ 
+figure('Name', 'Temps d''exécution moyen par méthode'); % Initialize figure container for runtime comparative bar chart
+b_time = bar(mean_time'); % Render bar chart of computational timing performance
+set(gca, 'XTickLabel', algos); % Set categorical x-axis ticks to algorithm names
+ylabel('Temps moyen (s)'); % Set y-axis label for time duration
+title('Comparaison des temps de calcul réels (sans post-traitement)'); % Set title for runtime figure
+legend(arrayfun(@(x) sprintf('%d dB', x), snr_list, 'UniformOutput', false), 'Location', 'best'); % Construct legend series for SNR levels
+grid on; % Enable plot grid lines
+ 
+figure('Name', 'Occupation mémoire moyenne par méthode'); % Initialize figure container for memory usage comparative bar chart
+b_mem = bar(mean_mem'); % Render bar chart of memory allocation performance
+set(gca, 'XTickLabel', algos); % Set categorical x-axis ticks to algorithm names
+ylabel('Mémoire moyenne (KB)'); % Set y-axis label for memory usage
+title('Comparaison de l''occupation mémoire (KB) (sans post-traitement)'); % Set title for memory usage figure
+legend(arrayfun(@(x) sprintf('%d dB', x), snr_list, 'UniformOutput', false), 'Location', 'best'); % Construct legend series for SNR levels
+grid on; % Enable plot grid lines
